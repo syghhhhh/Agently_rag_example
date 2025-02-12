@@ -1,0 +1,196 @@
+# -*- coding: utf-8 -*-
+# @Time    : 2025/2/11 16:03
+# @Author  : syghhhhh
+# @File    : server_agent_test.py
+import json
+from pydantic import BaseModel
+import Agently
+import requests
+import nest_asyncio
+nest_asyncio.apply()
+import asyncio
+
+tool_using_workflow = Agently.Workflow()
+
+
+
+@tool_using_workflow.chunk()
+def save_user_input(inputs, storage):
+    storage.set("user_input", inputs["default"])
+    return
+
+
+@tool_using_workflow.chunk()
+def make_next_plan(inputs, storage):
+    agent = storage.get("$agent")
+    user_input = storage.get("user_input")
+    tools_info = storage.get("tools_info", {})
+    tools_list = []
+    for key, value in tools_info.items():
+        tools_list.append({
+            "工具名称": key,
+            "工具描述": value["desc"],
+            "所需参数": value["kwargs"],
+        })
+    result = (
+        agent
+            .set_role("姓名", "智能助手")
+            .set_role("角色", "你是xxx的一名智能助手")
+            .set_role(
+                "行动规则",
+                "首先需要根据{意图判定规则}对用户输入进行意图判定," +
+                "根据上下文，将客户问题总结成简单问句，如果问句主语不全，根据上下文补全问句主语"
+            )
+            .set_role(
+                "意图判定规则",
+                "从['日常闲聊', 'xxx相关问题']中选择你判定的用户意图"
+            )
+            .info({
+                "可用工具清单": tools_list,
+            })
+            .input(user_input)
+            .output({
+                "next_step_thinking": ("str",),
+                "next_step_action": {
+                    "type": ("'xxx相关问题' | '日常闲聊'", "MUST IN values provided."),
+                    "reply": ("str", "if {next_step_action.type} == '输出结果'，输出你的最终回复结果，else输出''"),
+                    "tool_using": (
+                        {
+                            "tool_name": ("str from {可用工具清单.工具名称}", "必须使用{可用工具清单}提供的工具"),
+                            "kwargs": ("dict", "根据{可用工具清单.所需参数}要求给出所需参数"),
+                        },
+                    ),
+                }
+            })
+            .start()
+    )
+    return result["next_step_action"]
+
+
+@tool_using_workflow.chunk()
+def rag_reply(inputs, storage):
+    search_result = storage.get("search_result", [])
+    agent = storage.get("$agent")
+    user_input = storage.get("user_input")
+    result = (
+        agent
+        .set_role("姓名", "智能助手")
+        .set_role("角色", "你是xxx的一名智能助手")
+        .input(user_input)
+        .info({
+                "知识库内容": search_result,
+            })
+        .instruct([
+            "结合检索到的知识库中的内容{search_result}来回答用户提问的问题{user_input}，不能编造知识库中不存在的内容",
+            "如果无法找到相关的答案，则回答 '您可以尝试问问其他相关问题'",
+        ])
+        .output({
+            "reply": ("str", "结合{search_result}，对{user_input}的回复"),
+            "next_questions": ([("str", "根据{reply}内容，结合用户之前的提问{user_input}，给用户推荐的可以进一步提问的问题")], "不少于3个"),
+        })
+        .start()
+    )
+    return result
+
+
+@tool_using_workflow.chunk()
+def reply(inputs, storage):
+    if storage.get("print_process"):
+        print("[💬 我觉得可以回复了]：")
+        print("✅ 我的回复是：", inputs["default"]["reply"])
+
+    if inputs["default"].get("next_questions"):
+        print("🤔 我还可以给你推荐以下问题：")
+        for question in inputs["default"]["next_questions"]:
+            print("✅", question)
+        return {
+            "reply": inputs["default"]["reply"],
+            "next_questions": inputs["default"]["next_questions"],
+        }
+    else:
+        return {
+            "reply": inputs["default"]["reply"],
+        }
+
+@tool_using_workflow.chunk()
+async def use_tool(inputs, storage):
+    tool_using_info = inputs["default"]["tool_using"]
+    print("[🪛 我准备使用工具]：", tool_using_info)
+    tools_info = storage.get("tools_info")
+    print("🪛 我可以使用的工具有：", tools_info)
+    tool_func = tools_info[tool_using_info["tool_name"]]["func"]
+    if storage.get("print_process"):
+        # print("[🪛 我觉得需要使用工具]：")
+        print("🤔 我想要使用的工具是：", tool_using_info["tool_name"])
+    if asyncio.iscoroutine(tool_func):
+        tool_result = await tool_func(**tool_using_info["kwargs"])
+    else:
+        tool_result = tool_func(**tool_using_info["kwargs"])
+    if storage.get("print_process"):
+        print("🎉 我得到的结果是：", tool_result[:30], "...")
+    storage.set("search_result", tool_result)
+    return
+
+
+(
+    tool_using_workflow
+        .connect_to("save_user_input")
+        .connect_to("make_next_plan")
+        .if_condition(lambda return_value, storage: return_value["type"] == "日常闲聊")
+            .connect_to("reply")
+            .connect_to("end")
+        .else_condition()
+            .connect_to("use_tool")
+            .connect_to("rag_reply")
+            .connect_to("reply")
+            .connect_to("end")
+)
+
+
+
+
+class Item(BaseModel):
+    query_text: str
+    conversation_id: str
+
+
+def get_chat_history(conversation_id: str):
+    # TODO: get chat history from database
+    pass
+    return ''
+
+
+# 搜索工具
+def search(query_text:str):
+    response = requests.request(method="POST",
+                                url="http://ip:port/search",
+                                headers={'Content-Type': 'application/json'},
+                                data=json.dumps({"text": query_text,}))
+    return response.json()
+
+
+rag_agent = (
+    Agently.create_agent()
+        .set_settings("current_model", "OAIClient")
+        .set_settings("model.OAIClient.auth.api_key", "")
+        .set_settings("model.OAIClient.url", "https://api.deepseek.com/")
+        .set_settings("model.OAIClient.options.model", "deepseek-chat")
+)
+rag_agent.attach_workflow("tool_using", tool_using_workflow)
+
+
+if __name__ == '__main__':
+    result_test = rag_agent.tool_using(
+        "北京在哪里？",
+        tools_info={
+            "search": {
+                "desc": "知识库中搜索{query_text}相关的信息",
+                "kwargs": {
+                    "query_text": ("str", "用户的查询文本"),
+                },
+                "func": search,
+            },
+        },
+        print_process=True,
+    )
+    print("最终结果:\n", result_test["default"]["reply"])
